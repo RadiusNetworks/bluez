@@ -39,6 +39,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <signal.h>
+#include <time.h>
 
 #include "lib/bluetooth.h"
 #include "lib/hci.h"
@@ -2405,8 +2406,11 @@ failed:
 	snprintf(buf, buf_len, "(unknown)");
 }
 
-static int print_advertising_devices(int dd, uint8_t filter_type)
+static int print_advertising_devices(int dd, uint8_t filter_type, int scan_duration, time_t cmd_init_time)
 {
+	/* Declare time variable */
+	time_t current_time;
+
 	unsigned char buf[HCI_MAX_EVENT_SIZE], *ptr;
 	struct hci_filter nf, of;
 	struct sigaction sa;
@@ -2438,15 +2442,32 @@ static int print_advertising_devices(int dd, uint8_t filter_type)
 		le_advertising_info *info;
 		char addr[18];
 
-		while ((len = read(dd, buf, sizeof(buf))) < 0) {
-			if (errno == EINTR && signal_received == SIGINT) {
-				len = 0;
+		fd_set         input;
+		FD_ZERO(&input);
+		FD_SET(dd, &input);
+		struct timeval timeout;
+		timeout.tv_sec = 1; // Set socket timeout to 1 second
+		timeout.tv_usec = 0;
+		int n = select(dd + 1, &input, NULL, NULL, &timeout);
+		if (n == -1) {
+			//something wrong (e.g., received SIGINT)
+			goto done;
+		} else if (n == 0) {
+			//read timed out
+			goto skip_processing;
+		}
+		else {
+			while ((len = read(dd, buf, sizeof(buf))) < 0) {
+				/* Exit if interrupt received */
+				if (errno == EINTR && signal_received == SIGINT) {
+					len = 0;
+					goto done;
+				}
+				if (errno == EAGAIN || errno == EINTR) {
+					continue;
+				}
 				goto done;
 			}
-
-			if (errno == EAGAIN || errno == EINTR)
-				continue;
-			goto done;
 		}
 
 		ptr = buf + (1 + HCI_EVENT_HDR_SIZE);
@@ -2455,7 +2476,7 @@ static int print_advertising_devices(int dd, uint8_t filter_type)
 		meta = (void *) ptr;
 
 		if (meta->subevent != 0x02)
-			goto done;
+		goto done;
 
 		/* Ignoring multiple reports */
 		info = (le_advertising_info *) (meta->data + 1);
@@ -2466,11 +2487,20 @@ static int print_advertising_devices(int dd, uint8_t filter_type)
 
 			ba2str(&info->bdaddr, addr);
 			eir_parse_name(info->data, info->length,
-							name, sizeof(name) - 1);
+				name, sizeof(name) - 1);
 
-			printf("%s %s\n", addr, name);
+				printf("%s %s\n", addr, name);
+			}
+
+skip_processing:
+			/* Set current time and exit peacefully if scan duration limit is reached */
+			time (&current_time);
+			if (scan_duration > 0) {
+				if (difftime(current_time, cmd_init_time) >= scan_duration) {
+					goto done;
+				}
+			}
 		}
-	}
 
 done:
 	setsockopt(dd, SOL_HCI, HCI_FILTER, &of, sizeof(of));
@@ -2489,6 +2519,7 @@ static struct option lescan_options[] = {
 	{ "whitelist",	0, 0, 'w' },
 	{ "discovery",	1, 0, 'd' },
 	{ "duplicates",	0, 0, 'D' },
+	{ "duration", 1, 0, 't' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -2499,11 +2530,12 @@ static const char *lescan_help =
 	"\tlescan [--whitelist] scan for address in the whitelist only\n"
 	"\tlescan [--discovery=g|l] enable general or limited discovery"
 		"procedure\n"
-	"\tlescan [--duplicates] don't filter duplicates\n";
+	"\tlescan [--duplicates] don't filter duplicates\n"
+	"\tlescan [--duration] set duration of scan in seconds\n";
 
 static void cmd_lescan(int dev_id, int argc, char **argv)
 {
-	int err, opt, dd;
+	int err, opt, dd, scan_duration = -1;
 	uint8_t own_type = LE_PUBLIC_ADDRESS;
 	uint8_t scan_type = 0x01;
 	uint8_t filter_type = 0;
@@ -2511,6 +2543,10 @@ static void cmd_lescan(int dev_id, int argc, char **argv)
 	uint16_t interval = htobs(0x0010);
 	uint16_t window = htobs(0x0010);
 	uint8_t filter_dup = 0x01;
+
+	/* Declare command init time variable */
+	time_t cmd_init_time;
+	time (&cmd_init_time);
 
 	for_each_opt(opt, lescan_options, NULL) {
 		switch (opt) {
@@ -2532,13 +2568,17 @@ static void cmd_lescan(int dev_id, int argc, char **argv)
 				fprintf(stderr, "Unknown discovery procedure\n");
 				exit(1);
 			}
-
 			interval = htobs(0x0012);
 			window = htobs(0x0012);
 			break;
 		case 'D':
 			filter_dup = 0x00;
 			break;
+		case 't':
+			if (atoi(optarg) >= 1) {
+				scan_duration = atoi(optarg);
+			}
+		  break;
 		default:
 			printf("%s", lescan_help);
 			return;
@@ -2570,7 +2610,7 @@ static void cmd_lescan(int dev_id, int argc, char **argv)
 
 	printf("LE Scan ...\n");
 
-	err = print_advertising_devices(dd, filter_type);
+	err = print_advertising_devices(dd, filter_type, scan_duration, cmd_init_time);
 	if (err < 0) {
 		perror("Could not receive advertising events");
 		exit(1);
